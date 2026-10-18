@@ -70,6 +70,13 @@
 - **2026-09**: 新增网络层重试/退避：`requests.Session` 挂载 `HTTPAdapter` + `urllib3.Retry`（total=3、指数退避 1/2/4s、对 429/5xx 自动重试），降低 CI 网络抖动导致的误报失败；业务 200 响应不受影响。
 
 
+## 每日执行与成功判定
+
+- 工作流每天按 `Asia/Shanghai` 时区在 07:18、10:18、13:18、16:18、19:18、22:18 触发，支持手动运行，并在签到前运行离线回归测试。
+- 只有接口明确返回成功，或重复签到时通过积分历史确认北京时间当天的 `system:checkin` 记录，才认为该账号已完成签到。未知返回、无 Cookie、所有域名签到失败都会以非零状态退出。
+- 日志和 Actions Summary 保留业务返回码及结果；默认保留运行记录，便于核实。没有收到警告邮件不能作为成功依据。
+- GitHub 定时任务可能延迟或丢弃；Cookie 也可能过期。多次执行能减少漏跑风险，无法保证外部平台永远可用。认证或设备校验失败时，需要重新登录并更新 Cookie。
+
 ## 问题排查与定位
 - 大家可以通过查询 actions 中的 running checkin 日志快速定位问题，有其他问题提交issue。
 - 若日志出现 `code : 4, message : Automated check-in detected`：这是 GLaDOS 的**设备平台校验**（`reason=device-mismatch`，即签到请求 UA 平台与登录设备平台不一致）。脚本已内置**设备平台自适应**：首次失败时自动读取服务端返回的 `loginDevice` 并切换对应平台 UA 重试，**无需手动配置 User-Agent**；若长期仍失败，请重新登录 glados.cloud 手动签到一次并刷新 cookie。

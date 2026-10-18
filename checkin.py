@@ -1,7 +1,9 @@
 import requests
 import json
 import os
+import sys
 import logging
+from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -9,6 +11,7 @@ from pypushdeer import PushDeer
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging_config import init_logger
+from zoneinfo import ZoneInfo
 
 
 class CheckinStatus(Enum):
@@ -72,10 +75,13 @@ def log_method(func):
             result = func(self, *args, **kwargs)
             return result
         except Exception as e:
-            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {e}")
+            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {type(e).__name__}")
 
             DEFAULT_ERRORS = {
-                "checkin": {"status": "签到失败", "points": "0", "message": ""},
+                "checkin": {
+                    "status": "签到失败", "points": "0", "message": "",
+                    "code": CheckinStatus.FAILURE, "api_code": None,
+                },
                 "get_status": ("None 天", -2),
                 "get_points": ("None 积分", 0),
                 "exchange": "",
@@ -85,7 +91,7 @@ def log_method(func):
                 error_template = DEFAULT_ERRORS[method_name]
                 if isinstance(error_template, dict):
                     error_result = error_template.copy()
-                    error_result["message"] = f"执行失败: {e}"
+                    error_result["message"] = f"执行失败: {type(e).__name__}"
                     return error_result
                 return error_template
             raise
@@ -220,7 +226,7 @@ class API:
             try:
                 self.session.close()
             except Exception as e:
-                logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
+                logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {type(e).__name__}")
 
     def __enter__(self):
         """进入上下文管理器"""
@@ -264,19 +270,19 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, data=data, timeout=(10, 20))
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = self.session.get(url, headers=session_headers, timeout=(10, 20))
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
             if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                self._log("warning", LogEmoji.WARNING, f"HTTP 请求失败，状态码 {response.status_code}", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            self._log("error", LogEmoji.ERROR, f"HTTP 请求失败: {type(e).__name__}", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -302,7 +308,37 @@ class API:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
                 raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
 
-        return self._parse_checkin(raw)
+        # code 1 alone is ambiguous: only account history can confirm today's check-in.
+        repeat_confirmed = (
+            isinstance(raw, dict)
+            and type(raw.get("code")) is int
+            and raw["code"] == CheckinStatus.REPEAT.value
+            and self._has_checkin_today(cookies)
+        )
+        return self._parse_checkin(raw, repeat_confirmed=repeat_confirmed)
+
+    def _has_checkin_today(self, cookies: str) -> bool:
+        """以服务端积分流水确认上海时区当天的签到，不猜测返回消息。"""
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        response = self._make_request(self._get_full_url(self.POINTS_URL), "GET", cookies=cookies)
+        if response is None:
+            return False
+        try:
+            data = response.json()
+        except ValueError:
+            self._log("warning", LogEmoji.WARNING, "积分流水响应解析失败，无法确认今日签到", force=True)
+            return False
+        if not isinstance(data, dict) or type(data.get("code")) is not int or data["code"] != 0:
+            return False
+        history = data.get("history")
+        if not isinstance(history, list):
+            return False
+        return any(
+            isinstance(record, dict)
+            and record.get("business") == "system:checkin"
+            and record.get("detail") == today
+            for record in history
+        )
 
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
@@ -325,13 +361,14 @@ class API:
 
         return raw
 
-    def _parse_checkin(self, raw: Optional[Dict]) -> Dict[str, Union[str, CheckinStatus]]:
+    def _parse_checkin(self, raw: Optional[Dict], repeat_confirmed: bool = False) -> Dict[str, Union[str, CheckinStatus]]:
         """解析签到响应为结果字典"""
         result: Dict[str, Union[str, CheckinStatus]] = {
             "status": "签到失败",
             "points": "0",
             "message": "",
             "code": CheckinStatus.FAILURE,
+            "api_code": None,
         }
 
         if not raw:
@@ -339,19 +376,20 @@ class API:
             return result
 
         code = raw.get("code", -2)
+        result["api_code"] = code
         message = raw.get("message", "无消息字段")
         points = str(raw.get("points", 0))
 
-        if code == CheckinStatus.SUCCESS.value:
-            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
+        if type(code) is int and code == CheckinStatus.SUCCESS.value:
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.SUCCESS
             result["status"] = "签到成功"
             result["points"] = points
             result["message"] = message
-        elif code == CheckinStatus.REPEAT.value:
+        elif type(code) is int and code == CheckinStatus.REPEAT.value and repeat_confirmed:
             self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.REPEAT
-            result["status"] = "重复签到"
+            result["status"] = "今日签到已由积分流水确认"
             result["points"] = "0"
             result["message"] = message
         else:
@@ -395,7 +433,7 @@ class API:
         if response:
             data = response.json()
             code = data.get("code", -2)
-            points = data.get("points", None)
+            points = data.get("currentPoints", data.get("points"))
 
             if points is not None:
                 points_int = int(float(points))
@@ -444,10 +482,25 @@ class CheckinResult:
     points_total: str = "None"
     exchange: str = "未兑换"
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
+    api_code: Optional[int] = None
+    message: str = ""
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
         result_dict = asdict(self)
         return result_dict
+
+
+class PushDeerWithTimeout(PushDeer):
+    """为原库的通知 HTTP 请求设置有限的连接和读取超时。"""
+
+    def _send_push_request(self, desp, key, server, text, text_type):
+        response = requests.get(
+            server + self.endpoint,
+            params={"pushkey": key, "text": text, "type": text_type, "desp": desp},
+            timeout=(10, 20),
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 class PushService:
@@ -463,12 +516,14 @@ class PushService:
             return False
 
         try:
-            pushdeer = PushDeer(pushkey=self.config.push_key)
-            pushdeer.send_text(title, desp=content)
+            pushdeer = PushDeerWithTimeout(pushkey=self.config.push_key)
+            if not pushdeer.send_text(title, desp=content):
+                logger.error(f"{LogEmoji.ERROR} 推送服务未确认通知发送成功。")
+                return False
             logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
             return True
         except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
+            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {type(e).__name__}")
             return False
 
 
@@ -526,6 +581,9 @@ class Checker:
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.api_code = checkin_result.get("api_code")
+            result.message = checkin_result.get("message", "")
+            result.points = checkin_result.get("points", "0")
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
@@ -565,13 +623,14 @@ class Checker:
         send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
-            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            evidence = f"api_code={res['api_code']}, message={res['message']}"
+            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {evidence} | {res['exchange']}"
             send_content_lines.append(line)
 
             if self.config.verbose:
                 log_line = line
             else:
-                log_line = f"#{i} {res['status']}"
+                log_line = f"#{i} Cookie[{res['cookie_index']}] {res['domain']} {res['status']} | {evidence}"
             log_content_lines.append(log_line)
 
         content = "\n".join(send_content_lines)
@@ -583,8 +642,11 @@ class Checker:
 logger = init_logger()
 
 
-def main():
+def main() -> int:
     """主函数"""
+    config = None
+    exit_code = 1
+    title, content, log_content = "# 脚本执行出错", "", ""
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -603,17 +665,37 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
+            confirmed_cookies = {
+                result.cookie_index for result in checker.results
+                if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+            }
+            expected_cookies = set(range(1, len(config.cookies_list) + 1))
+            exit_code = 0 if expected_cookies.issubset(confirmed_cookies) else 1
+            logger.info(f"已确认今日签到的 Cookie: {len(confirmed_cookies)}/{len(expected_cookies)}")
 
     except Exception as e:
-        logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        error_message = f"主程序执行失败: {type(e).__name__}"
+        logger.error(f"{LogEmoji.ERROR} {error_message}")
+        title, content, log_content = "# 脚本执行出错", error_message, error_message
 
-    # 4. 发送推送
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as summary:
+                summary.write(f"## {title}\n\n退出码: {exit_code}\n\n{log_content or content}\n")
+        except OSError as e:
+            logger.warning(f"{LogEmoji.WARNING} 写入运行摘要失败: {type(e).__name__}")
+
+    # 通知错误不能改变已确认的签到退出状态。
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
-    logger.info(f"{LogEmoji.END} 签到完成")
+    if config is not None:
+        try:
+            PushService(config).send(title, content)
+        except Exception as e:
+            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {type(e).__name__}")
+    logger.info(f"{LogEmoji.END} 签到完成，退出码: {exit_code}")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
